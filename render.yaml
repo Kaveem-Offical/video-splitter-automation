@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: video-processor
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: GOOGLE_DRIVE_CREDENTIALS_JSON
+        sync: false
+      - key: GOOGLE_DRIVE_FOLDER_ID
+        sync: false
+    healthCheckPath: /health
+    disk:
+      name: video-processor-disk
+      mountPath: /app/storage
+      sizeGB: 10
