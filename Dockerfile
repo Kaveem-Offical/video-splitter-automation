@@ -7,7 +7,6 @@ WORKDIR /app
 # Install system dependencies including FFmpeg
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    ffprobe \
     curl \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
@@ -20,6 +19,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
+
+# Create tmp directory and set permissions
+RUN mkdir -p /tmp && chmod 777 /tmp
 
 # Create non-root user for security
 RUN groupadd -r appuser && useradd -r -g appuser appuser
