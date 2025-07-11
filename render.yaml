@@ -1,16 +1,31 @@
 services:
   - type: web
-    name: video-processor
+    name: video-splitter-api
     env: docker
+    region: oregon
     plan: free
     dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: false
+    buildCommand: ""
+    startCommand: ""
     envVars:
-      - key: GOOGLE_DRIVE_CREDENTIALS_JSON
+      - key: CLOUDINARY_CLOUD_NAME
         sync: false
-      - key: GOOGLE_DRIVE_FOLDER_ID
+      - key: CLOUDINARY_API_KEY
         sync: false
-    healthCheckPath: /health
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: PORT
+        value: "5000"
+      - key: FLASK_DEBUG
+        value: "false"
+      - key: PYTHONUNBUFFERED
+        value: "1"
     disk:
-      name: video-processor-disk
-      mountPath: /app/storage
+      name: video-splitter-disk
+      mountPath: /tmp
       sizeGB: 10
+    healthCheckPath: /health
+    preDeployCommand: ""
+    postDeployCommand: ""
