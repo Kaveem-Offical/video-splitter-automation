@@ -80,22 +80,32 @@ def split_video(video_path, segment_duration):
 def process_segment_with_overlay(segment_path, idx, movie_name, output_dir):
     output_file = os.path.join(output_dir, f"{movie_name}_part_{idx:03d}.mp4")
     cmd = [
-        "ffmpeg",
-        "-i", segment_path,
-        "-loop", "1", "-t", "3", "-i", "end_credit.png",
-        "-i", "image.png",
-        "-filter_complex",
-        f"[2:v]scale=1080:-1[top];"
-        f"[0:v]scale=1080:1312:force_original_aspect_ratio=decrease,pad=1080:1920:0:608:color=black[main];"
-        f"[main][top]overlay=0:0[over];"
-        f"[over]drawtext=text='Part No - {idx}':fontfile=Poppins-Regular.ttf:fontsize=48:fontcolor=white:x=(w-tw)/2:y=1220[txt1];"
-        f"[txt1]drawtext=text='{movie_name}':fontfile=Poppins-Regular.ttf:fontsize=48:fontcolor=white:x=(w-tw)/2:y=1266[txt2];"
-        f"[1:v]scale=1080:1920[end];"
-        f"[txt2][end]concat=n=2:v=1:a=0[outv];[0:a]aresample=async=1[outa]",
-        "-map", "[outv]", "-map", "[outa]",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k", "-y", output_file
-    ]
+    "ffmpeg",
+    "-i", segment_path,                             # Main segment
+    "-loop", "1", "-t", "3", "-i", "end_credit.png",# End credit (3s image as video)
+    "-i", "image.png",                              # Top banner image
+    "-filter_complex",
+    f"""
+    [2:v]scale=1080:-1,setsar=1[top];
+    [0:v]scale=1080:1312:force_original_aspect_ratio=decrease,pad=1080:1920:0:608:color=black,setsar=1[main];
+    [main][top]overlay=0:0[over];
+    [over]drawtext=text='Part No - {idx}':fontfile={Config.FONT_FILE}:fontsize=48:fontcolor=white:x=(w-tw)/2:y=1220[txt1];
+    [txt1]drawtext=text='{movie_name}':fontfile={Config.FONT_FILE}:fontsize=48:fontcolor=white:x=(w-tw)/2:y=1266[txt2];
+    [1:v]scale=1080:1920,setsar=1[end];
+    [txt2][end]concat=n=2:v=1:a=0[outv];
+    [0:a]aresample=async=1[outa]
+    """.replace("\n", ""),  # FFmpeg doesn't like actual line breaks
+    "-map", "[outv]",
+    "-map", "[outa]",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "23",
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-y",
+    output_file
+]
+
     subprocess.run(cmd, check=True)
     return output_file
 
