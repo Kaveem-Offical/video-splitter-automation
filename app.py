@@ -16,6 +16,8 @@ import cloudinary.uploader
 import cloudinary.api
 from dotenv import load_dotenv
 import psutil
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Load environment variables
 load_dotenv()
@@ -40,6 +42,7 @@ class Config:
     END_CREDIT = "end_credit.png"  # End credit image (portrait, 1080x1920)
     END_CREDIT_DURATION = 3  # Duration of end credit in seconds
     IDLE_TIMEOUT_MINUTES = int(os.getenv('IDLE_TIMEOUT_MINUTES', 5))  # Minutes before shutdown
+    CLOUDINARY_POOL_MAXSIZE = int(os.getenv('CLOUDINARY_POOL_MAXSIZE', 10))  # Connection pool size for Cloudinary
 
 # Store active temp directories for cleanup
 active_temp_dirs = set()
@@ -47,6 +50,13 @@ active_temp_dirs = set()
 # Track last request time for idle shutdown
 last_request_time = time.time()
 shutdown_event = threading.Event()
+
+# Configure custom HTTP adapter for Cloudinary requests
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+adapter = HTTPAdapter(pool_maxsize=Config.CLOUDINARY_POOL_MAXSIZE, max_retries=retries)
+session.mount('https://api.cloudinary.com', adapter)
+cloudinary.uploader._session = session  # Override Cloudinary's default session
 
 def cleanup_all_temp_dirs():
     """Clean up all active temporary directories"""
@@ -65,6 +75,7 @@ def signal_handler(signum, frame):
     logger.info(f"🔄 Received signal {signum}, cleaning up...")
     cleanup_all_temp_dirs()
     shutdown_event.set()
+    session.close()  # Close the custom session
     os._exit(0)
 
 # Register cleanup handlers
@@ -456,6 +467,7 @@ def upload_to_cloudinary(file_path, folder_name="video_splits", segment_info=Non
                 'fallback': segment_info.get('fallback', False)
             })
         
+        start_time = time.time()
         result = cloudinary.uploader.upload(
             file_path,
             resource_type="video",
@@ -471,7 +483,8 @@ def upload_to_cloudinary(file_path, folder_name="video_splits", segment_info=Non
             eager_async=True
         )
         
-        logger.info(f"✅ Successfully uploaded {filename} to Cloudinary - Public ID: {result['public_id']}")
+        upload_duration = time.time() - start_time
+        logger.info(f"✅ Successfully uploaded {filename} to Cloudinary - Public ID: {result['public_id']}, Duration: {upload_duration:.2f}s")
         return {
             'public_id': result['public_id'],
             'secure_url': result['secure_url'],
@@ -514,6 +527,7 @@ def idle_shutdown():
         if time_since_last_request > Config.IDLE_TIMEOUT_MINUTES * 60:
             logger.info(f"🛑 No requests for {Config.IDLE_TIMEOUT_MINUTES} minutes, shutting down...")
             cleanup_all_temp_dirs()
+            session.close()  # Close the custom session
             shutdown_event.set()
             os._exit(0)
         time.sleep(60)  # Check every minute
