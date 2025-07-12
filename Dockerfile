@@ -17,8 +17,11 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
+# Copy application code and required assets
+COPY app.py .
+COPY image.png .
+COPY Poppins-Regular.ttf .
+COPY end_credit.mp4 .
 
 # Create tmp directory and set permissions
 RUN mkdir -p /tmp && chmod 777 /tmp

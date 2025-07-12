@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# Configuration for image, text overlay, and end credit
+class Config:
+    TOP_IMAGE = "image.png"  # 1920x1080 image for overlay
+    FONT_FILE = "Poppins-Regular.ttf"  # Font file for text overlay
+    END_CREDIT = "end_credit.mp4"  # End credit video (portrait, 1080x1920)
+
 # Store active temp directories for cleanup
 active_temp_dirs = set()
 
@@ -87,6 +93,20 @@ def check_ffmpeg():
         logger.error(f"❌ FFmpeg check failed: {str(e)}")
         return False
 
+def check_dependencies():
+    """Check if required files exist"""
+    missing_items = []
+    for file_path in [Config.TOP_IMAGE, Config.FONT_FILE, Config.END_CREDIT]:
+        if not os.path.exists(file_path):
+            missing_items.append(f"Required file: {file_path}")
+    if missing_items:
+        logger.error("Missing dependencies:")
+        for item in missing_items:
+            logger.error(f"  - {item}")
+        return False
+    logger.info("All dependencies found")
+    return True
+
 def get_video_duration(video_path):
     """Get video duration using FFmpeg"""
     try:
@@ -121,7 +141,6 @@ def get_video_info(video_path):
             import json
             info = json.loads(result.stdout)
             
-            # Extract video stream info
             video_stream = next((s for s in info['streams'] if s['codec_type'] == 'video'), None)
             format_info = info['format']
             
@@ -146,9 +165,13 @@ def get_video_info(video_path):
         return None
 
 def split_video_ffmpeg(video_path, segment_duration=60, overlap=0):
-    """Split video using FFmpeg with optional overlap"""
+    """Split video using FFmpeg with image overlay, text, and end credit"""
     try:
         logger.info(f"🔪 Starting video split - Duration: {segment_duration}s, Overlap: {overlap}s")
+        
+        # Check dependencies
+        if not check_dependencies():
+            raise Exception("Missing required dependencies (image, font, or end credit file)")
         
         # Get video duration
         duration = get_video_duration(video_path)
@@ -165,6 +188,10 @@ def split_video_ffmpeg(video_path, segment_duration=60, overlap=0):
         segment_info = []
         temp_dir = os.path.dirname(video_path)
         
+        # Get video name for text overlay
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        video_name_escaped = video_name.replace("'", "\\'").replace(":", "\\:")
+        
         for i in range(num_segments):
             start_time = i * effective_duration
             actual_duration = min(segment_duration, duration - start_time)
@@ -177,15 +204,24 @@ def split_video_ffmpeg(video_path, segment_duration=60, overlap=0):
             
             logger.info(f"⚡ Creating segment {i+1}/{num_segments}: {segment_filename}")
             
-            # FFmpeg command to extract segment
+            # FFmpeg command to extract segment, add overlay/text, and concatenate end credit
             cmd = [
-                'ffmpeg', '-i', video_path,
-                '-ss', str(start_time),
-                '-t', str(actual_duration),
-                '-c', 'copy',  # Copy streams without re-encoding (faster)
-                '-avoid_negative_ts', 'make_zero',
-                segment_path,
-                '-y'  # Overwrite output file
+                'ffmpeg', '-i', video_path, '-i', Config.TOP_IMAGE, '-i', Config.END_CREDIT,
+                '-filter_complex',
+                f"[0:v]trim=start={start_time}:duration={actual_duration},scale=1080:1312:force_original_aspect_ratio=decrease,pad=1080:1312:0:0:color=black,setsar=1[main_vid];"
+                f"[1:v]scale=1080:-1,setsar=1[top_image];"
+                f"[main_vid]pad=1080:1920:0:608:color=black,setsar=1[padded_base];"
+                f"[padded_base][top_image]overlay=0:0[combined];"
+                f"[combined]drawtext=text='Part No - {i+1}':fontfile={Config.FONT_FILE}:fontsize=48:fontcolor=white:x=(w-tw)/2:y=1220[with_part];"
+                f"[with_part]drawtext=text='{video_name_escaped}':fontfile={Config.FONT_FILE}:fontsize=48:fontcolor=white:x=(w-tw)/2:y=1266[with_text];"
+                f"[2:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[end_scaled];"
+                f"[with_text][end_scaled]concat=n=2:v=1:a=0[outv];"
+                f"[0:a]atrim=start={start_time}:duration={actual_duration},asetpts=PTS-STARTPTS,aresample=async=1[outa]",
+                '-map', '[outv]', '-map', '[outa]',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-movflags', '+faststart', '-y',
+                segment_path
             ]
             
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -227,7 +263,6 @@ def download_video(url, temp_dir):
     try:
         logger.info(f"⬇️ Starting video download from: {url}")
         
-        # Get file size first
         head_response = requests.head(url, timeout=30)
         file_size = int(head_response.headers.get('content-length', 0))
         logger.info(f"📦 File size: {file_size/1024/1024:.2f}MB" if file_size > 0 else "📦 File size: Unknown")
@@ -235,7 +270,6 @@ def download_video(url, temp_dir):
         response = requests.get(url, stream=True, timeout=60)
         response.raise_for_status()
         
-        # Determine file extension from URL or content-type
         content_type = response.headers.get('content-type', '')
         if 'video/mp4' in content_type or url.endswith('.mp4'):
             ext = '.mp4'
@@ -244,7 +278,7 @@ def download_video(url, temp_dir):
         elif 'video/mov' in content_type or url.endswith('.mov'):
             ext = '.mov'
         else:
-            ext = '.mp4'  # Default
+            ext = '.mp4'
         
         video_path = os.path.join(temp_dir, f"input_video{ext}")
         
@@ -256,7 +290,6 @@ def download_video(url, temp_dir):
                 downloaded += len(chunk)
                 if file_size > 0:
                     progress = (downloaded / file_size) * 100
-                    # Log progress every 10%
                     if progress - last_progress >= 10:
                         logger.info(f"📈 Download progress: {progress:.1f}%")
                         last_progress = progress
@@ -274,7 +307,6 @@ def upload_to_cloudinary(file_path, folder_name="video_splits", segment_info=Non
         file_size = os.path.getsize(file_path)
         logger.info(f"☁️ Uploading to Cloudinary: {filename} ({file_size/1024/1024:.2f}MB)")
         
-        # Prepare metadata
         context = {}
         if segment_info:
             context.update({
@@ -291,7 +323,7 @@ def upload_to_cloudinary(file_path, folder_name="video_splits", segment_info=Non
             public_id=f"{folder_name}/{filename.replace('.mp4', '')}",
             overwrite=True,
             context=context,
-            timeout=300,  # 5 minutes timeout
+            timeout=300,
             eager=[
                 {"quality": "auto", "format": "mp4"},
                 {"quality": "auto:low", "format": "mp4", "width": 640}
@@ -321,7 +353,6 @@ def cleanup_temp_files(temp_dir):
     """Clean up temporary files"""
     try:
         if os.path.exists(temp_dir):
-            # Get directory size before cleanup
             total_size = sum(os.path.getsize(os.path.join(dirpath, filename))
                            for dirpath, dirnames, filenames in os.walk(temp_dir)
                            for filename in filenames)
@@ -330,7 +361,6 @@ def cleanup_temp_files(temp_dir):
             remove_temp_dir(temp_dir)
             logger.info(f"🧹 Cleaned up temp directory: {temp_dir} (freed {total_size/1024/1024:.2f}MB)")
             
-            # Force garbage collection
             gc.collect()
         else:
             logger.info(f"🧹 Temp directory already cleaned: {temp_dir}")
@@ -345,7 +375,6 @@ def split_video_endpoint():
     
     temp_dir = None
     try:
-        # Check if FFmpeg is available
         if not check_ffmpeg():
             logger.error(f"❌ [REQUEST-{request_id}] FFmpeg not available")
             return jsonify({
@@ -353,7 +382,6 @@ def split_video_endpoint():
                 'message': 'FFmpeg is not installed or not in PATH. Please install FFmpeg to use this service.'
             }), 500
         
-        # Get request data
         data = request.get_json()
         if not data or 'video_url' not in data:
             logger.error(f"❌ [REQUEST-{request_id}] Missing video_url in request")
@@ -368,7 +396,6 @@ def split_video_endpoint():
         folder_name = data.get('folder_name', 'video_splits')
         upload_to_cloud = data.get('upload_to_cloud', True)
         
-        # Validate inputs
         if segment_duration <= 0:
             logger.error(f"❌ [REQUEST-{request_id}] Invalid segment_duration: {segment_duration}")
             return jsonify({
@@ -385,7 +412,6 @@ def split_video_endpoint():
         
         logger.info(f"📋 [REQUEST-{request_id}] Processing config - Duration: {segment_duration}s, Overlap: {overlap}s, Upload: {upload_to_cloud}")
         
-        # Verify Cloudinary configuration if uploading
         if upload_to_cloud and not verify_cloudinary_config():
             logger.error(f"❌ [REQUEST-{request_id}] Cloudinary configuration failed")
             return jsonify({
@@ -393,7 +419,6 @@ def split_video_endpoint():
                 'message': 'Cloudinary configuration error. Please check your credentials.'
             }), 500
         
-        # Create temporary directory
         temp_dir = tempfile.mkdtemp(prefix=f"video_split_{request_id}_")
         add_temp_dir(temp_dir)
         logger.info(f"📁 [REQUEST-{request_id}] Created temp directory: {temp_dir}")
@@ -401,19 +426,15 @@ def split_video_endpoint():
         start_time = datetime.now()
         
         try:
-            # Download video
             logger.info(f"⬇️ [REQUEST-{request_id}] Starting video download")
             video_path = download_video(video_url, temp_dir)
             
-            # Get video information
             logger.info(f"📊 [REQUEST-{request_id}] Analyzing video")
             video_info = get_video_info(video_path)
             
-            # Split video using FFmpeg
             logger.info(f"🔪 [REQUEST-{request_id}] Starting video split")
             segment_files, segment_info = split_video_ffmpeg(video_path, segment_duration, overlap)
             
-            # Upload segments to Cloudinary (if enabled)
             uploaded_files = []
             failed_uploads = []
             
@@ -429,14 +450,11 @@ def split_video_endpoint():
                 
                 logger.info(f"📤 [REQUEST-{request_id}] Upload completed - Success: {len(uploaded_files)}, Failed: {len(failed_uploads)}")
             
-            # Cleanup temporary files
             cleanup_temp_files(temp_dir)
-            temp_dir = None  # Prevent double cleanup
+            temp_dir = None
             
-            # Calculate processing time
             processing_time = (datetime.now() - start_time).total_seconds()
             
-            # Prepare response
             response = {
                 'success': True,
                 'request_id': request_id,
@@ -493,7 +511,6 @@ def list_videos():
         
         logger.info(f"📋 Listing videos from folder: {folder_name}")
         
-        # Get videos from Cloudinary
         result = cloudinary.api.resources(
             resource_type="video",
             type="upload",
@@ -516,7 +533,6 @@ def list_videos():
                 'created_at': resource['created_at']
             }
             
-            # Add context/metadata if available
             if 'context' in resource:
                 video_data['metadata'] = resource['context']
             
@@ -554,23 +570,18 @@ def get_video_info_endpoint():
         
         video_url = data['video_url']
         
-        # Create temporary directory
         temp_dir = tempfile.mkdtemp(prefix=f"video_info_{request_id}_")
         add_temp_dir(temp_dir)
         
         try:
-            # Download video
             video_path = download_video(video_url, temp_dir)
             
-            # Get video information
             video_info = get_video_info(video_path)
             
-            # Cleanup
             cleanup_temp_files(temp_dir)
             temp_dir = None
             
             if video_info:
-                # Calculate estimated segments
                 segment_duration = data.get('segment_duration', 60)
                 overlap = data.get('overlap', 0)
                 effective_duration = segment_duration - overlap
@@ -614,7 +625,6 @@ def health_check():
     cloudinary_status = verify_cloudinary_config()
     ffmpeg_status = check_ffmpeg()
     
-    # Check system resources
     import psutil
     cpu_percent = psutil.cpu_percent(interval=1)
     memory = psutil.virtual_memory()
@@ -665,7 +675,7 @@ def index():
         'version': '1.0.0',
         'status': 'running',
         'endpoints': {
-            'POST /split-video': 'Split video into segments and optionally upload to Cloudinary',
+            'POST /split-video': 'Split video into segments with image overlay, text, and end credit, and optionally upload to Cloudinary',
             'POST /video-info': 'Get video information without processing',
             'GET /list-videos': 'List uploaded videos from Cloudinary',
             'GET /health': 'Health check with system metrics',
