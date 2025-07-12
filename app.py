@@ -7,12 +7,15 @@ import shutil
 import signal
 import atexit
 import gc
+import threading
+import time
 from datetime import datetime
 from flask import Flask, request, jsonify
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
 from dotenv import load_dotenv
+import psutil
 
 # Load environment variables
 load_dotenv()
@@ -30,14 +33,20 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Configuration for image, text overlay, and end credit
+# Configuration for image, text overlay, end credit, and idle timeout
 class Config:
     TOP_IMAGE = "image.png"  # 1920x1080 image for overlay
     FONT_FILE = "Poppins-Regular.ttf"  # Font file for text overlay
-    END_CREDIT = "end_credit.mp4"  # End credit video (portrait, 1080x1920)
+    END_CREDIT = "end_credit.png"  # End credit image (portrait, 1080x1920)
+    END_CREDIT_DURATION = 3  # Duration of end credit in seconds
+    IDLE_TIMEOUT_MINUTES = int(os.getenv('IDLE_TIMEOUT_MINUTES', 5))  # Minutes before shutdown
 
 # Store active temp directories for cleanup
 active_temp_dirs = set()
+
+# Track last request time for idle shutdown
+last_request_time = time.time()
+shutdown_event = threading.Event()
 
 def cleanup_all_temp_dirs():
     """Clean up all active temporary directories"""
@@ -55,7 +64,8 @@ def signal_handler(signum, frame):
     """Handle shutdown signals"""
     logger.info(f"🔄 Received signal {signum}, cleaning up...")
     cleanup_all_temp_dirs()
-    exit(0)
+    shutdown_event.set()
+    os._exit(0)
 
 # Register cleanup handlers
 atexit.register(cleanup_all_temp_dirs)
@@ -164,14 +174,25 @@ def get_video_info(video_path):
         logger.error(f"❌ Error getting video info: {str(e)}")
         return None
 
+def log_resource_usage():
+    """Log current CPU and memory usage"""
+    cpu_percent = psutil.cpu_percent(interval=1)
+    memory = psutil.virtual_memory()
+    logger.info(f"📈 Resource usage - CPU: {cpu_percent}%, Memory: {memory.percent}%")
+    return cpu_percent, memory.percent
+
 def split_video_ffmpeg(video_path, segment_duration=60, overlap=0):
-    """Split video using FFmpeg with image overlay, text, and end credit"""
+    """Split video using FFmpeg with image overlay, text, and end credit image"""
     try:
         logger.info(f"🔪 Starting video split - Duration: {segment_duration}s, Overlap: {overlap}s")
         
+        # Log initial resource usage
+        log_resource_usage()
+        
         # Check dependencies
         if not check_dependencies():
-            raise Exception("Missing required dependencies (image, font, or end credit file)")
+            logger.warning("⚠️ Missing dependencies, falling back to basic splitting")
+            return basic_split_video_ffmpeg(video_path, segment_duration, overlap)
         
         # Get video duration
         duration = get_video_duration(video_path)
@@ -188,9 +209,137 @@ def split_video_ffmpeg(video_path, segment_duration=60, overlap=0):
         segment_info = []
         temp_dir = os.path.dirname(video_path)
         
+        # Step 1: Split video using stream copy
+        temp_segment_dir = os.path.join(temp_dir, "temp_segments")
+        os.makedirs(temp_segment_dir, exist_ok=True)
+        add_temp_dir(temp_segment_dir)
+        
+        split_cmd = [
+            'ffmpeg', '-i', video_path, '-c', 'copy', '-f', 'segment',
+            '-segment_time', str(segment_duration), '-reset_timestamps', '1',
+            '-avoid_negative_ts', 'make_zero', '-y',
+            os.path.join(temp_segment_dir, "temp_segment_%03d.mp4")
+        ]
+        
+        result = subprocess.run(split_cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            logger.error(f"❌ FFmpeg split error: {result.stderr}")
+            raise Exception("Failed to split video")
+        
+        temp_segments = sorted([f for f in os.listdir(temp_segment_dir) if f.startswith("temp_segment_")])
+        logger.info(f"📋 Created {len(temp_segments)} temporary segments")
+        
         # Get video name for text overlay
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         video_name_escaped = video_name.replace("'", "\\'").replace(":", "\\:")
+        
+        # Step 2: Process each segment with overlay, text, and end credit image
+        for i in range(num_segments):
+            start_time = i * effective_duration
+            actual_duration = min(segment_duration, duration - start_time)
+            
+            if actual_duration <= 0:
+                break
+                
+            temp_segment_path = os.path.join(temp_segment_dir, f"temp_segment_{i+1:03d}.mp4")
+            if not os.path.exists(temp_segment_path):
+                logger.warning(f"⚠️ Temporary segment {i+1} not found, skipping")
+                continue
+                
+            segment_filename = f"segment_{i+1:03d}.mp4"
+            segment_path = os.path.join(temp_dir, segment_filename)
+            
+            logger.info(f"⚡ Processing segment {i+1}/{num_segments}: {segment_filename}")
+            
+            # FFmpeg command to add overlay, text, and end credit image
+            cmd = [
+                'ffmpeg', '-i', temp_segment_path, '-i', Config.TOP_IMAGE, '-i', Config.END_CREDIT,
+                '-filter_complex',
+                f"[0:v]scale=1080:1312:force_original_aspect_ratio=decrease,pad=1080:1312:0:0:color=black,setsar=1[main_vid];"
+                f"[1:v]scale=1080:-1,setsar=1[top_image];"
+                f"[main_vid]pad=1080:1920:0:608:color=black,setsar=1[padded_base];"
+                f"[padded_base][top_image]overlay=0:0[combined];"
+                f"[combined]drawtext=text='Part No - {i+1}':fontfile={Config.FONT_FILE}:fontsize=48:fontcolor=white:x=(w-tw)/2:y=1220[with_part];"
+                f"[with_part]drawtext=text='{video_name_escaped}':fontfile={Config.FONT_FILE}:fontsize=48:fontcolor=white:x=(w-tw)/2:y=1266[with_text];"
+                f"[2:v]loop=loop={Config.END_CREDIT_DURATION*30}:size=1,setpts=PTS-STARTPTS,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[end_scaled];"
+                f"[with_text][end_scaled]concat=n=2:v=1:a=0[outv];"
+                f"[0:a]atrim=0:{actual_duration},asetpts=PTS-STARTPTS,apad=pad_dur={Config.END_CREDIT_DURATION},aresample=async=1[outa]",
+                '-map', '[outv]', '-map', '[outa]',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-t', str(actual_duration + Config.END_CREDIT_DURATION),
+                '-movflags', '+faststart', '-y',
+                segment_path
+            ]
+            
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                if result.returncode == 0:
+                    segment_files.append(segment_path)
+                    segment_info.append({
+                        'filename': segment_filename,
+                        'start_time': start_time,
+                        'duration': actual_duration + Config.END_CREDIT_DURATION,
+                        'segment_number': i + 1,
+                        'file_size': os.path.getsize(segment_path)
+                    })
+                    logger.info(f"✅ Segment {i+1} processed successfully - Size: {os.path.getsize(segment_path)/1024/1024:.2f}MB")
+                else:
+                    logger.error(f"❌ FFmpeg error for segment {i+1}: {result.stderr}")
+                    # Fallback to using the temp segment
+                    shutil.copy(temp_segment_path, segment_path)
+                    segment_files.append(segment_path)
+                    segment_info.append({
+                        'filename': segment_filename,
+                        'start_time': start_time,
+                        'duration': actual_duration,
+                        'segment_number': i + 1,
+                        'file_size': os.path.getsize(segment_path),
+                        'fallback': True
+                    })
+                    logger.warning(f"⚠️ Used fallback for segment {i+1}")
+            except subprocess.TimeoutExpired:
+                logger.error(f"❌ FFmpeg timeout for segment {i+1}")
+                # Fallback to using the temp segment
+                shutil.copy(temp_segment_path, segment_path)
+                segment_files.append(segment_path)
+                segment_info.append({
+                    'filename': segment_filename,
+                    'start_time': start_time,
+                    'duration': actual_duration,
+                    'segment_number': i + 1,
+                    'file_size': os.path.getsize(segment_path),
+                    'fallback': True
+                })
+                logger.warning(f"⚠️ Used fallback for segment {i+1} due to timeout")
+            
+            log_resource_usage()
+        
+        # Clean up temporary segments
+        cleanup_temp_files(temp_segment_dir)
+        
+        logger.info(f"🎉 Video split completed: {len(segment_files)} segments created")
+        return segment_files, segment_info
+        
+    except Exception as e:
+        logger.error(f"❌ Error splitting video with FFmpeg: {str(e)}")
+        raise
+
+def basic_split_video_ffmpeg(video_path, segment_duration=60, overlap=0):
+    """Fallback splitting without overlay or end credit"""
+    try:
+        logger.info(f"🔪 Fallback: Basic video split - Duration: {segment_duration}s, Overlap: {overlap}s")
+        
+        duration = get_video_duration(video_path)
+        if duration == 0:
+            raise Exception("Could not determine video duration")
+        
+        effective_duration = segment_duration - overlap
+        num_segments = int(duration // effective_duration) + (1 if duration % effective_duration > 0 else 0)
+        
+        segment_files = []
+        segment_info = []
+        temp_dir = os.path.dirname(video_path)
         
         for i in range(num_segments):
             start_time = i * effective_duration
@@ -204,24 +353,14 @@ def split_video_ffmpeg(video_path, segment_duration=60, overlap=0):
             
             logger.info(f"⚡ Creating segment {i+1}/{num_segments}: {segment_filename}")
             
-            # FFmpeg command to extract segment, add overlay/text, and concatenate end credit
             cmd = [
-                'ffmpeg', '-i', video_path, '-i', Config.TOP_IMAGE, '-i', Config.END_CREDIT,
-                '-filter_complex',
-                f"[0:v]trim=start={start_time}:duration={actual_duration},scale=1080:1312:force_original_aspect_ratio=decrease,pad=1080:1312:0:0:color=black,setsar=1[main_vid];"
-                f"[1:v]scale=1080:-1,setsar=1[top_image];"
-                f"[main_vid]pad=1080:1920:0:608:color=black,setsar=1[padded_base];"
-                f"[padded_base][top_image]overlay=0:0[combined];"
-                f"[combined]drawtext=text='Part No - {i+1}':fontfile={Config.FONT_FILE}:fontsize=48:fontcolor=white:x=(w-tw)/2:y=1220[with_part];"
-                f"[with_part]drawtext=text='{video_name_escaped}':fontfile={Config.FONT_FILE}:fontsize=48:fontcolor=white:x=(w-tw)/2:y=1266[with_text];"
-                f"[2:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[end_scaled];"
-                f"[with_text][end_scaled]concat=n=2:v=1:a=0[outv];"
-                f"[0:a]atrim=start={start_time}:duration={actual_duration},asetpts=PTS-STARTPTS,aresample=async=1[outa]",
-                '-map', '[outv]', '-map', '[outa]',
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-                '-c:a', 'aac', '-b:a', '128k',
-                '-movflags', '+faststart', '-y',
-                segment_path
+                'ffmpeg', '-i', video_path,
+                '-ss', str(start_time),
+                '-t', str(actual_duration),
+                '-c', 'copy',
+                '-avoid_negative_ts', 'make_zero',
+                segment_path,
+                '-y'
             ]
             
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -232,18 +371,18 @@ def split_video_ffmpeg(video_path, segment_duration=60, overlap=0):
                     'start_time': start_time,
                     'duration': actual_duration,
                     'segment_number': i + 1,
-                    'file_size': os.path.getsize(segment_path)
+                    'file_size': os.path.getsize(segment_path),
+                    'fallback': True
                 })
                 logger.info(f"✅ Segment {i+1} created successfully - Size: {os.path.getsize(segment_path)/1024/1024:.2f}MB")
             else:
                 logger.error(f"❌ FFmpeg error for segment {i+1}: {result.stderr}")
-                # Continue with other segments even if one fails
         
-        logger.info(f"🎉 Video split completed: {len(segment_files)} segments created")
+        logger.info(f"🎉 Fallback split completed: {len(segment_files)} segments created")
         return segment_files, segment_info
         
     except Exception as e:
-        logger.error(f"❌ Error splitting video with FFmpeg: {str(e)}")
+        logger.error(f"❌ Error in fallback splitting: {str(e)}")
         raise
 
 def verify_cloudinary_config():
@@ -313,7 +452,8 @@ def upload_to_cloudinary(file_path, folder_name="video_splits", segment_info=Non
                 'segment_number': segment_info.get('segment_number', 0),
                 'start_time': segment_info.get('start_time', 0),
                 'duration': segment_info.get('duration', 0),
-                'file_size': segment_info.get('file_size', 0)
+                'file_size': segment_info.get('file_size', 0),
+                'fallback': segment_info.get('fallback', False)
             })
         
         result = cloudinary.uploader.upload(
@@ -366,6 +506,26 @@ def cleanup_temp_files(temp_dir):
             logger.info(f"🧹 Temp directory already cleaned: {temp_dir}")
     except Exception as e:
         logger.warning(f"⚠️ Error cleaning up temp files: {str(e)}")
+
+def idle_shutdown():
+    """Background thread to shut down server after idle period"""
+    while not shutdown_event.is_set():
+        time_since_last_request = time.time() - last_request_time
+        if time_since_last_request > Config.IDLE_TIMEOUT_MINUTES * 60:
+            logger.info(f"🛑 No requests for {Config.IDLE_TIMEOUT_MINUTES} minutes, shutting down...")
+            cleanup_all_temp_dirs()
+            shutdown_event.set()
+            os._exit(0)
+        time.sleep(60)  # Check every minute
+
+# Start idle shutdown thread
+threading.Thread(target=idle_shutdown, daemon=True).start()
+
+@app.before_request
+def update_last_request_time():
+    """Update last request time before each request"""
+    global last_request_time
+    last_request_time = time.time()
 
 @app.route('/split-video', methods=['POST'])
 def split_video_endpoint():
@@ -625,7 +785,6 @@ def health_check():
     cloudinary_status = verify_cloudinary_config()
     ffmpeg_status = check_ffmpeg()
     
-    import psutil
     cpu_percent = psutil.cpu_percent(interval=1)
     memory = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
@@ -642,7 +801,8 @@ def health_check():
             'cpu_percent': cpu_percent,
             'memory_percent': memory.percent,
             'disk_percent': (disk.used / disk.total) * 100,
-            'active_temp_dirs': len(active_temp_dirs)
+            'active_temp_dirs': len(active_temp_dirs),
+            'seconds_since_last_request': int(time.time() - last_request_time)
         }
     }
     
@@ -675,7 +835,7 @@ def index():
         'version': '1.0.0',
         'status': 'running',
         'endpoints': {
-            'POST /split-video': 'Split video into segments with image overlay, text, and end credit, and optionally upload to Cloudinary',
+            'POST /split-video': 'Split video into segments with image overlay, text, and end credit image, and optionally upload to Cloudinary',
             'POST /video-info': 'Get video information without processing',
             'GET /list-videos': 'List uploaded videos from Cloudinary',
             'GET /health': 'Health check with system metrics',

@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY image.png .
 COPY Poppins-Regular.ttf .
-COPY end_credit.mp4 .
+COPY end_credit.png .
 
 # Create tmp directory and set permissions
 RUN mkdir -p /tmp && chmod 777 /tmp
