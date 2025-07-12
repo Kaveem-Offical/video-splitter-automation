@@ -58,6 +58,9 @@ adapter = HTTPAdapter(pool_maxsize=Config.CLOUDINARY_POOL_MAXSIZE, max_retries=r
 session.mount('https://api.cloudinary.com', adapter)
 cloudinary.uploader._session = session  # Override Cloudinary's default session
 
+# Define a lock for Cloudinary verification
+cloudinary_lock = threading.Lock()
+
 def cleanup_all_temp_dirs():
     """Clean up all active temporary directories"""
     global active_temp_dirs
@@ -397,16 +400,19 @@ def basic_split_video_ffmpeg(video_path, segment_duration=60, overlap=0):
         raise
 
 def verify_cloudinary_config():
-    """Verify Cloudinary configuration"""
-    try:
-        logger.info("🔐 Verifying Cloudinary configuration...")
-        result = cloudinary.api.ping()
-        is_authenticated = result.get('status') == 'ok'
-        logger.info(f"☁️ Cloudinary status: {'✅ Authenticated' if is_authenticated else '❌ Failed'}")
-        return is_authenticated
-    except Exception as e:
-        logger.error(f"❌ Cloudinary authentication failed: {str(e)}")
-        return False
+    """Verify Cloudinary configuration with lock to prevent concurrent requests"""
+    with cloudinary_lock:
+        try:
+            logger.info("🔐 Acquiring lock for Cloudinary configuration verification...")
+            result = cloudinary.api.ping()
+            is_authenticated = result.get('status') == 'ok'
+            logger.info(f"☁️ Cloudinary status: {'✅ Authenticated' if is_authenticated else '❌ Failed'}")
+            return is_authenticated
+        except Exception as e:
+            logger.error(f"❌ Cloudinary authentication failed: {str(e)}")
+            return False
+        finally:
+            logger.info("🔓 Releasing lock for Cloudinary verification")
 
 def download_video(url, temp_dir):
     """Download video from URL to temporary directory"""
