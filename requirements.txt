@@ -4,3 +4,4 @@ python-dotenv==1.0.0
 requests==2.31.0
 psutil==5.9.8
 Werkzeug==2.3.7
+gunicorn==20.1.0
