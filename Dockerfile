@@ -1,42 +1,28 @@
-# Use Python slim image for smaller size
+# Use slim Python image
 FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies including FFmpeg
+# Install system dependencies (FFmpeg)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
+# Copy requirement files and install dependencies
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code and required assets
-COPY app.py .
-COPY image.png .
-COPY Poppins-Regular.ttf .
-COPY end_credit.png .
-
-# Create tmp directory and set permissions
-RUN mkdir -p /tmp && chmod 777 /tmp
-
-# Create non-root user for security
-RUN groupadd -r appuser && useradd -r -g appuser appuser
-RUN chown -R appuser:appuser /app
-USER appuser
+# Copy app code and assets
+COPY . .
 
 # Expose port
 EXPOSE 5000
 
-# Health check
+# Health check (optional)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:5000/health || exit 1
+  CMD curl -f http://localhost:5000/health || exit 1
 
-# Start the application using Gunicorn (✅ PRODUCTION SAFE)
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--timeout", "21600", "app:app"]
+# Start app using Flask dev server
+CMD ["python", "app.py"]
